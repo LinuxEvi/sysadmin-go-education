@@ -1,223 +1,233 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"log"
+	"net/http"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
-func main() {
-	demoBreak()
-	demoCase()
-	demoChan()
-	demoConst()
-	demoContinue()
-	demoDefault()
-	demoDefer()
-	demoElse()
-	demoFallthrough()
-	demoFor()
-	demoFunc()
-	demoGo()
-	demoGoto()
-	demoIf()
-	demoInterface()
-	demoMap()
-	demoRange()
-	fmt.Println(demoReturn())
-	demoSelect()
-	demoStruct()
-	demoSwitch()
-	demoType()
-	demoVar()
+/*
+	✅ CLI → daemon dönüşümü: systemctl ile Go hizmeti
+
+	Plan: flag tabanlı CLI'yı arka planda çalışan (daemon) bir HTTP servisine dönüştür.
+	- http://localhost:8080/health JSON döner, en son sonuçları gösterir.
+	- http://localhost:8080/metrics Prometheus formatında metrik sağlar.
+	- Arka planda goroutine belirli aralıklarla hedefleri yoklar.
+
+	Systemd unit örneği (syscheck.service):
+
+	[Unit]
+	Description=Syscheck Go Service
+	After=network.target
+
+	[Service]
+	ExecStart=/usr/local/bin/syscheck --targets="https://www.google.com,https://www.linuxevi.org,https://www.github.com" --interval=10s
+	Restart=always
+	User=syscheck
+	Group=syscheck
+
+	[Install]
+	WantedBy=multi-user.target
+
+	Deployment akışı:
+	1) Yukarıdaki systemd unit dosyasını /etc/systemd/system/syscheck.service olarak kaydet
+	2) GOOS=linux GOARCH=amd64 go build -o syscheck
+	3) Binary'yi /usr/local/bin altına kopyala
+	4) sudo systemctl enable --now syscheck
+	5) journalctl -u syscheck -f ile log takibini yap
+*/
+
+var (
+	targetsFlag  = flag.String("targets", "https://example.com", "virgülle ayrılmış HTTP hedefleri")
+	timeoutFlag  = flag.Duration("timeout", 5*time.Second, "her istek için timeout")
+	intervalFlag = flag.Duration("interval", 30*time.Second, "health-check periyodu")
+	listenAddr   = flag.String("listen", ":8080", "HTTP server adresi")
+)
+
+type checkResult struct {
+	Target     string    `json:"target"`
+	StatusCode int       `json:"status_code"`
+	LastError  string    `json:"last_error,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
 }
 
-func demoBreak() {
-	for i := 0; i < 5; i++ {
-		if i == 2 {
-			fmt.Println("break döngüyü 2'de durdurur")
-			break
-		}
+type resultStore struct {
+	mu          sync.RWMutex
+	results     map[string]checkResult
+	successHits int
+	failHits    int
+}
+
+func newResultStore(targets []string) *resultStore {
+	store := &resultStore{
+		results: make(map[string]checkResult, len(targets)),
 	}
-}
-
-func demoCase() {
-	value := 1
-	switch value {
-	case 1:
-		fmt.Println("case değeri 1 ile eşleşti")
-	case 2:
-		fmt.Println("case değeri 2 ile eşleşti")
+	for _, t := range targets {
+		store.results[t] = checkResult{Target: t}
 	}
+	return store
 }
 
-func demoChan() {
-	ch := make(chan string, 1)
-	ch <- "chan veriyi taşıyor"
-	fmt.Println(<-ch)
-}
-
-func demoConst() {
-	const greeting = "const değerleri değişmez tutar"
-	fmt.Println(greeting)
-}
-
-func demoContinue() {
-	for i := 0; i < 3; i++ {
-		if i == 1 {
-			continue
-		}
-		fmt.Println("continue değeri atlar", i)
-	}
-}
-
-func demoDefault() {
-	value := 42
-	switch value {
-	default:
-		fmt.Println("default uyuşmayan değerleri yakalar")
-	}
-}
-
-func demoDefer() {
-	defer fmt.Println("defer en son çalışır")
-	fmt.Println("defer işi sıraya koyar")
-}
-
-func demoElse() {
-	number := 5
-	if number > 5 {
-		fmt.Println("sayı daha büyük")
+func (s *resultStore) update(res checkResult, success bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.results[res.Target] = res
+	if success {
+		s.successHits++
 	} else {
-		fmt.Println("else kalan durumları ele alır")
+		s.failHits++
 	}
 }
 
-func demoFallthrough() {
-	value := 1
-	switch value {
-	case 1:
-		fmt.Println("ilk dal")
-		fallthrough
-	case 2:
-		fmt.Println("fallthrough sonraki dalı zorlar")
+func (s *resultStore) snapshot() (map[string]checkResult, int, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cp := make(map[string]checkResult, len(s.results))
+	for k, v := range s.results {
+		cp[k] = v
 	}
+	return cp, s.successHits, s.failHits
 }
 
-func demoFor() {
-	for i := 0; i < 2; i++ {
-		fmt.Println("for döngüsü", i, "değerini geziyor")
+func main() {
+	flag.Parse()
+
+	targets := parseTargets(*targetsFlag)
+	if len(targets) == 0 {
+		log.Fatal("en az bir hedef URL gerekli")
 	}
-}
-
-func demoFunc() {
-	inner := func(name string) string {
-		return fmt.Sprintf("func literalleri çalışır, merhaba %s", name)
+	if *timeoutFlag <= 0 {
+		log.Fatal("timeout sıfırdan büyük olmalı")
 	}
-	fmt.Println(inner("Gopher"))
-}
-
-func demoGo() {
-	done := make(chan struct{})
-	go func() {
-		fmt.Println("go anahtar kelimesi goroutine başlatır")
-		close(done)
-	}()
-	<-done
-}
-
-func demoGoto() {
-	count := 0
-start:
-	count++
-	if count < 2 {
-		goto start
+	if *intervalFlag <= 0 {
+		log.Fatal("interval sıfırdan büyük olmalı")
 	}
-	fmt.Println("goto etiketlere atlar")
-}
 
-func demoIf() {
-	if 1 < 2 {
-		fmt.Println("if koşulları değerlendirir")
-	}
-}
+	log.Printf("syscheck daemon %s adresinde dinliyor (%d hedef)\n", *listenAddr, len(targets))
 
-type interfaceWrapper struct {
-	data string
-}
+	store := newResultStore(targets)
+	client := &http.Client{Timeout: *timeoutFlag}
 
-func (w interfaceWrapper) Describe() string {
-	return w.data
-}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-func demoInterface() {
-	type describer interface {
-		Describe() string
-	}
-	var d describer = interfaceWrapper{data: "interface çok biçimliliğe izin verir"}
-	fmt.Println(d.Describe())
-}
+	go runCheckLoop(ctx, client, store, targets, *intervalFlag)
 
-func demoMap() {
-	m := map[string]int{"apples": 3}
-	fmt.Println("map araması:", m["apples"])
-}
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		results, success, failure := store.snapshot()
+		payload := map[string]any{
+			"status":        deriveStatus(results),
+			"success_count": success,
+			"failure_count": failure,
+			"results":       results,
+		}
+		writeJSON(w, payload)
+	})
 
-func demoRange() {
-	values := []int{1, 2}
-	for idx, val := range values {
-		fmt.Printf("range indeks %d değer %d\n", idx, val)
-	}
-}
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		_, success, failure := store.snapshot()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "syscheck_success_total %d\n", success)
+		fmt.Fprintf(w, "syscheck_failure_total %d\n", failure)
+	})
 
-func demoReturn() string {
-	return "return değerleri geri döner"
-}
-
-func demoSelect() {
-	ch1 := make(chan string, 1)
-	ch2 := make(chan string, 1)
+	server := &http.Server{Addr: *listenAddr}
 
 	go func() {
-		time.Sleep(10 * time.Millisecond)
-		ch2 <- "select ch2 kanalını seçti"
+		<-ctx.Done()
+		log.Println("kapanış sinyali alındı, HTTP server kapatılıyor")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
 	}()
-	ch1 <- "select ch1 kanalını seçti"
 
-	select {
-	case msg := <-ch1:
-		fmt.Println(msg)
-	case msg := <-ch2:
-		fmt.Println(msg)
-	default:
-		fmt.Println("select default dalına düştü")
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server hatası: %v", err)
+	}
+
+	log.Println("syscheck temiz biçimde kapandı")
+}
+
+func runCheckLoop(ctx context.Context, client *http.Client, store *resultStore, targets []string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	checkOnce := func() {
+		for _, target := range targets {
+			status, err := checkTarget(client, target)
+			res := checkResult{
+				Target:    target,
+				CheckedAt: time.Now(),
+			}
+			if err != nil {
+				res.LastError = err.Error()
+				store.update(res, false)
+				log.Printf("FAIL: %s %v\n", target, err)
+				continue
+			}
+			res.StatusCode = status
+			store.update(res, true)
+			log.Printf("OK: %s %d\n", target, status)
+		}
+	}
+
+	checkOnce()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkOnce()
+		}
 	}
 }
 
-func demoStruct() {
-	type point struct {
-		X int
-		Y int
+func parseTargets(raw string) []string {
+	parts := strings.Split(raw, ",")
+	var cleaned []string
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
 	}
-	p := point{X: 1, Y: 2}
-	fmt.Println("struct alanları:", p.X, p.Y)
+	return cleaned
 }
 
-func demoSwitch() {
-	switch time.Now().Weekday() {
-	case time.Saturday, time.Sunday:
-		fmt.Println("switch hafta sonunu yakaladı")
-	default:
-		fmt.Println("switch hafta içini yakaladı")
+func checkTarget(client *http.Client, target string) (int, error) {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return 0, err
 	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
-func demoType() {
-	type localInt int
-	var value localInt = 7
-	fmt.Println("type yeni takma tipler tanımlar:", value)
+func deriveStatus(results map[string]checkResult) string {
+	for _, r := range results {
+		if r.LastError != "" || r.StatusCode >= 400 || r.StatusCode == 0 {
+			return "degraded"
+		}
+	}
+	return "healthy"
 }
 
-func demoVar() {
-	var count int = 5
-	fmt.Println("var değişken tanımlar:", count)
+func writeJSON(w http.ResponseWriter, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
