@@ -1,223 +1,141 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"log"
+	"net/http"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+/*
+	✅ Prometheus + Grafana Entegrasyonu
+
+	Senaryo: sysadmin'lerin gözünden, health-check servisinden çıkan metrikleri Prometheus'a,
+	oradan da Grafana paneline taşımak.
+
+	1) Go servisi counter metrik üretiyor:
+	   - syscheck_checks_success_total
+	   - syscheck_checks_failure_total
+	2) promhttp.Handler() ile /metrics endpoint'i açılıyor.
+	3) Prometheus örneği (prometheus.yml):
+
+		scrape_configs:
+		  - job_name: 'syscheck'
+		    static_configs:
+		      - targets: ['127.0.0.1:8080']
+
+	   Prometheus arayüzünde http://127.0.0.1:9090/graph adresinden bu metrikleri sorgula.
+	4) Grafana'da hazır bir dashboard panelinde bu metrikleri çiz:
+	   - Zaman içinde success vs fail grafiği
+	   - Mesaj: "Bakın, iki dakika önce yazdığımız Go servisin istatistiklerini burada izliyoruz.
+*/
+
+var (
+	targetsFlag  = flag.String("targets", "https://example.com", "virgülle ayrılmış hedef listesi")
+	timeoutFlag  = flag.Duration("timeout", 4*time.Second, "HTTP isteği için timeout")
+	intervalFlag = flag.Duration("interval", 15*time.Second, "health-check periyodu")
+	listenAddr   = flag.String("listen", ":8080", "HTTP dinleme adresi")
+
+	checkSuccess = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "syscheck_checks_success_total",
+		Help: "Başarılı health-check sayısı",
+	})
+	checkFail = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "syscheck_checks_failure_total",
+		Help: "Başarısız health-check sayısı",
+	})
 )
 
 func main() {
-	demoBreak()
-	demoCase()
-	demoChan()
-	demoConst()
-	demoContinue()
-	demoDefault()
-	demoDefer()
-	demoElse()
-	demoFallthrough()
-	demoFor()
-	demoFunc()
-	demoGo()
-	demoGoto()
-	demoIf()
-	demoInterface()
-	demoMap()
-	demoRange()
-	fmt.Println(demoReturn())
-	demoSelect()
-	demoStruct()
-	demoSwitch()
-	demoType()
-	demoVar()
+	flag.Parse()
+
+	targets := parseTargets(*targetsFlag)
+	if len(targets) == 0 {
+		log.Fatal("en az bir hedef URL gerekli")
+	}
+	if *timeoutFlag <= 0 || *intervalFlag <= 0 {
+		log.Fatal("timeout ve interval sıfırdan büyük olmalı")
+	}
+
+	client := &http.Client{Timeout: *timeoutFlag}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go runChecks(ctx, client, targets, *intervalFlag)
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "syscheck up - hedef sayısı: %d\n", len(targets))
+	})
+	http.Handle("/metrics", promhttp.Handler())
+
+	log.Printf("syscheck Prometheus demo %s adresinde dinliyor, %d hedefi denetliyor\n", *listenAddr, len(targets))
+
+	if err := http.ListenAndServe(*listenAddr, nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server hatası: %v", err)
+	}
 }
 
-func demoBreak() {
-	for i := 0; i < 5; i++ {
-		if i == 2 {
-			fmt.Println("break döngüyü 2'de durdurur")
-			break
+func runChecks(ctx context.Context, client *http.Client, targets []string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	checkOnce := func() {
+		for _, target := range targets {
+			if err := probe(client, target); err != nil {
+				checkFail.Inc()
+				log.Printf("FAIL: %s hata: %v\n", target, err)
+				continue
+			}
+			checkSuccess.Inc()
+			log.Printf("OK: %s\n", target)
+		}
+	}
+
+	checkOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkOnce()
 		}
 	}
 }
 
-func demoCase() {
-	value := 1
-	switch value {
-	case 1:
-		fmt.Println("case değeri 1 ile eşleşti")
-	case 2:
-		fmt.Println("case değeri 2 ile eşleşti")
+func probe(client *http.Client, target string) error {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return err
 	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("durum kodu %d", resp.StatusCode)
+	}
+	return nil
 }
 
-func demoChan() {
-	ch := make(chan string, 1)
-	ch <- "chan veriyi taşıyor"
-	fmt.Println(<-ch)
-}
-
-func demoConst() {
-	const greeting = "const değerleri değişmez tutar"
-	fmt.Println(greeting)
-}
-
-func demoContinue() {
-	for i := 0; i < 3; i++ {
-		if i == 1 {
-			continue
+func parseTargets(raw string) []string {
+	parts := strings.Split(raw, ",")
+	var cleaned []string
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
 		}
-		fmt.Println("continue değeri atlar", i)
 	}
-}
-
-func demoDefault() {
-	value := 42
-	switch value {
-	default:
-		fmt.Println("default uyuşmayan değerleri yakalar")
-	}
-}
-
-func demoDefer() {
-	defer fmt.Println("defer en son çalışır")
-	fmt.Println("defer işi sıraya koyar")
-}
-
-func demoElse() {
-	number := 5
-	if number > 5 {
-		fmt.Println("sayı daha büyük")
-	} else {
-		fmt.Println("else kalan durumları ele alır")
-	}
-}
-
-func demoFallthrough() {
-	value := 1
-	switch value {
-	case 1:
-		fmt.Println("ilk dal")
-		fallthrough
-	case 2:
-		fmt.Println("fallthrough sonraki dalı zorlar")
-	}
-}
-
-func demoFor() {
-	for i := 0; i < 2; i++ {
-		fmt.Println("for döngüsü", i, "değerini geziyor")
-	}
-}
-
-func demoFunc() {
-	inner := func(name string) string {
-		return fmt.Sprintf("func literalleri çalışır, merhaba %s", name)
-	}
-	fmt.Println(inner("Gopher"))
-}
-
-func demoGo() {
-	done := make(chan struct{})
-	go func() {
-		fmt.Println("go anahtar kelimesi goroutine başlatır")
-		close(done)
-	}()
-	<-done
-}
-
-func demoGoto() {
-	count := 0
-start:
-	count++
-	if count < 2 {
-		goto start
-	}
-	fmt.Println("goto etiketlere atlar")
-}
-
-func demoIf() {
-	if 1 < 2 {
-		fmt.Println("if koşulları değerlendirir")
-	}
-}
-
-type interfaceWrapper struct {
-	data string
-}
-
-func (w interfaceWrapper) Describe() string {
-	return w.data
-}
-
-func demoInterface() {
-	type describer interface {
-		Describe() string
-	}
-	var d describer = interfaceWrapper{data: "interface çok biçimliliğe izin verir"}
-	fmt.Println(d.Describe())
-}
-
-func demoMap() {
-	m := map[string]int{"apples": 3}
-	fmt.Println("map araması:", m["apples"])
-}
-
-func demoRange() {
-	values := []int{1, 2}
-	for idx, val := range values {
-		fmt.Printf("range indeks %d değer %d\n", idx, val)
-	}
-}
-
-func demoReturn() string {
-	return "return değerleri geri döner"
-}
-
-func demoSelect() {
-	ch1 := make(chan string, 1)
-	ch2 := make(chan string, 1)
-
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		ch2 <- "select ch2 kanalını seçti"
-	}()
-	ch1 <- "select ch1 kanalını seçti"
-
-	select {
-	case msg := <-ch1:
-		fmt.Println(msg)
-	case msg := <-ch2:
-		fmt.Println(msg)
-	default:
-		fmt.Println("select default dalına düştü")
-	}
-}
-
-func demoStruct() {
-	type point struct {
-		X int
-		Y int
-	}
-	p := point{X: 1, Y: 2}
-	fmt.Println("struct alanları:", p.X, p.Y)
-}
-
-func demoSwitch() {
-	switch time.Now().Weekday() {
-	case time.Saturday, time.Sunday:
-		fmt.Println("switch hafta sonunu yakaladı")
-	default:
-		fmt.Println("switch hafta içini yakaladı")
-	}
-}
-
-func demoType() {
-	type localInt int
-	var value localInt = 7
-	fmt.Println("type yeni takma tipler tanımlar:", value)
-}
-
-func demoVar() {
-	var count int = 5
-	fmt.Println("var değişken tanımlar:", count)
+	return cleaned
 }
