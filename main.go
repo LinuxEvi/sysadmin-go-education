@@ -26,13 +26,14 @@ import (
 	1) Go servisi counter metrik üretiyor:
 	   - syscheck_checks_success_total
 	   - syscheck_checks_failure_total
-	2) promhttp.Handler() ile /metrics endpoint'i açılıyor.
+	2) promhttp.Handler() ile http://127.0.0.1:8080/metrics endpoint'i açılıyor.
 	3) Prometheus örneği (prometheus.yml):
 
-		scrape_configs:
-		  - job_name: 'syscheck'
-		    static_configs:
-		      - targets: ['127.0.0.1:8080']
+  - job_name: "syscheck"
+    static_configs:
+      - targets: ["localhost:8080"]
+        labels:
+          app: "syscheck"
 
 	   Prometheus arayüzünde http://127.0.0.1:9090/graph adresinden bu metrikleri sorgula.
 	4) Grafana'da hazır bir dashboard panelinde bu metrikleri çiz:
